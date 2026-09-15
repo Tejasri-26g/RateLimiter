@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AegisGate | Live Telemetry & Control</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen p-6">
+  <div class="max-w-6xl mx-auto space-y-6">
+
+    <!-- Header -->
+    <header class="flex justify-between items-center pb-4 border-b border-slate-800">
+      <div>
+        <h1 class="text-3xl font-black tracking-tight text-emerald-400">AEGISGATE PROXY</h1>
+        <p class="text-sm text-slate-400">Distributed Sliding-Window Rate Limiting Engine</p>
+      </div>
+      <div id="connectionStatus" class="px-4 py-1 rounded-full text-xs font-mono font-semibold bg-emerald-950 text-emerald-300 border border-emerald-800">
+        SSE TELEMETRY: CONNECTED
+      </div>
+    </header>
+
+    <!-- Metrics Cards -->
+    <div class="grid grid-cols-4 gap-4">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs uppercase font-semibold text-slate-400">Total Throughput</div>
+        <div id="statTotal" class="text-3xl font-bold font-mono mt-1 text-slate-100">0</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs uppercase font-semibold text-emerald-400">Accepted (200 OK)</div>
+        <div id="statAccepted" class="text-3xl font-bold font-mono mt-1 text-emerald-400">0</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs uppercase font-semibold text-rose-400">Throttled (429 Blocked)</div>
+        <div id="statThrottled" class="text-3xl font-bold font-mono mt-1 text-rose-400">0</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs uppercase font-semibold text-indigo-400">Fail-Open Fallbacks</div>
+        <div id="statFallback" class="text-3xl font-bold font-mono mt-1 text-indigo-400">0</div>
+      </div>
+    </div>
+
+    <!-- Live Chart & Controls -->
+    <div class="grid grid-cols-3 gap-6">
+      <!-- Live Chart -->
+      <div class="col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-300 mb-4">Real-Time Traffic Graph</h2>
+        <div class="h-64">
+          <canvas id="trafficChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Action Panel -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 flex flex-col justify-between">
+        <div>
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-300 mb-3">Live Simulation Triggers</h2>
+          <p class="text-xs text-slate-400 mb-4 leading-relaxed">
+            Trigger simulated attacks directly from this interface or attach external load-testing tools like k6.
+          </p>
+          <div class="space-y-3">
+            <button onclick="sendBurst(1, false)" class="w-full py-2.5 px-4 bg-slate-800 hover:bg-slate-700 font-semibold text-xs rounded-lg transition border border-slate-700">
+              Send 1 Free Request (Limit: 5/10s)
+            </button>
+            <button onclick="sendBurst(15, false)" class="w-full py-2.5 px-4 bg-rose-950 hover:bg-rose-900 text-rose-200 border border-rose-800 font-semibold text-xs rounded-lg transition">
+              Attack Free Tier (Burst 15 Reqs)
+            </button>
+            <button onclick="sendBurst(20, true)" class="w-full py-2.5 px-4 bg-indigo-950 hover:bg-indigo-900 text-indigo-200 border border-indigo-800 font-semibold text-xs rounded-lg transition">
+              Simulate Pro Tier (Burst 20 Reqs)
+            </button>
+          </div>
+        </div>
+        <div class="mt-4 pt-3 border-t border-slate-800 text-[11px] font-mono text-slate-400">
+          Target Endpoint: <code class="text-emerald-400">GET /api/resource</code>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Event Stream Feed -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+      <div class="flex justify-between items-center mb-3">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-300">Live Gateway Log Feed</h2>
+        <button onclick="document.getElementById('logStream').innerHTML=''" class="text-xs text-slate-500 hover:text-slate-300">Clear Logs</button>
+      </div>
+      <div id="logStream" class="h-48 overflow-y-auto font-mono text-xs space-y-1.5 bg-black/60 p-3 rounded-lg border border-slate-800"></div>
+    </div>
+
+  </div>
+
+<script>
+  // ─── STATE ──────────────────────────────────────────────
+  let total = 0, accepted = 0, throttled = 0, fallbacks = 0;
+
+  // Per-tick counters (reset every 250ms)
+  let tickAccepted = 0, tickThrottled = 0;
+
+  // Rolling window of last N ticks for smooth rate display
+  // 4 ticks × 250ms = 1-second rolling window
+  const ROLLING_WINDOW = 4;
+  const TICK_MS = 250;
+  const POINTS_ON_CHART = 60;  // 60 × 250ms = 15 seconds of history
+
+  const rollingAccepted  = [];
+  const rollingThrottled = [];
+
+  // ─── CHART INIT ─────────────────────────────────────────
+  const ctx = document.getElementById('trafficChart').getContext('2d');
+  const chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: Array(POINTS_ON_CHART).fill(''),
+      datasets: [
+        {
+          label: '200 OK (Allowed)',
+          borderColor: '#34d399',
+          backgroundColor: 'rgba(52, 211, 153, 0.15)',
+          data: Array(POINTS_ON_CHART).fill(0),
+          tension: 0.35,
+          fill: true,
+          pointRadius: 0,
+          borderWidth: 2,
+        },
+        {
+          label: '429 Rate Limited',
+          borderColor: '#f87171',
+          backgroundColor: 'rgba(248, 113, 113, 0.15)',
+          data: Array(POINTS_ON_CHART).fill(0),
+          tension: 0.35,
+          fill: true,
+          pointRadius: 0,
+          borderWidth: 2,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 0 },       // ← no animation = fast redraws
+      interaction: { intersect: false, mode: 'index' },
+      scales: {
+        x: { grid: { color: '#1e293b' }, ticks: { display: false } },
+        y: {
+          beginAtZero: true,
+          grid: { color: '#1e293b' },
+          ticks: { color: '#94a3b8', font: { family: 'monospace' } }
+        }
+      },
+      plugins: {
+        legend: { labels: { color: '#cbd5e1', boxWidth: 12 } }
+      }
+    }
+  });
+
+  // ─── THE RENDER LOOP — fires every 250ms ────────────────
+  setInterval(() => {
+    // 1. Push the tick's counts to the chart
+    chart.data.datasets[0].data.push(tickAccepted);
+    chart.data.datasets[0].data.shift();
+    chart.data.datasets[1].data.push(tickThrottled);
+    chart.data.datasets[1].data.shift();
+    chart.update('none');   // 'none' = skip animation, redraw instantly
+
+    // 2. Add to rolling window
+    rollingAccepted.push(tickAccepted);
+    rollingThrottled.push(tickThrottled);
+    if (rollingAccepted.length  > ROLLING_WINDOW) rollingAccepted.shift();
+    if (rollingThrottled.length > ROLLING_WINDOW) rollingThrottled.shift();
+
+    // 3. Compute live rate = sum of last 4 ticks × (1000/250) = × 4
+    const liveAccepted  = rollingAccepted.reduce((a, b) => a + b, 0) * (1000 / TICK_MS);
+    const liveThrottled = rollingThrottled.reduce((a, b) => a + b, 0) * (1000 / TICK_MS);
+
+    document.getElementById('rateAccepted').innerText  = liveAccepted.toFixed(0);
+    document.getElementById('rateThrottled').innerText = liveThrottled.toFixed(0);
+
+    // 4. Reset tick counters
+    tickAccepted = 0;
+    tickThrottled = 0;
+  }, TICK_MS);
+
+  // ─── SSE CONNECTION ─────────────────────────────────────
+  const evtSource = new EventSource('/telemetry/stream');
+
+  evtSource.onmessage = function(event) {
+    const data = JSON.parse(event.data);
+
+    // Cumulative totals
+    total++;
+    if (data.status === 200) {
+      accepted++;
+      tickAccepted++;       // ← bump per-tick counter
+    } else {
+      throttled++;
+      tickThrottled++;
+    }
+    if (data.fallback) fallbacks++;
+
+    // Update stat cards immediately (no waiting for the next tick)
+    document.getElementById('statTotal').innerText     = total;
+    document.getElementById('statAccepted').innerText  = accepted;
+    document.getElementById('statThrottled').innerText = throttled;
+    document.getElementById('statFallback').innerText  = fallbacks;
+
+    // Append to log feed
+    const log = document.createElement('div');
+    const time = new Date().toLocaleTimeString();
+    const isOk = data.status === 200;
+    log.className = isOk ? 'text-emerald-400' : 'text-rose-400 font-bold';
+    log.innerText = `[${time}] ${data.status} | Client: ${data.clientId} | Remaining: ${data.remaining} | Retry-After: ${data.retryAfter}s ${data.fallback ? '| [FAIL-OPEN ACTIVE]' : ''}`;
+    document.getElementById('logStream').prepend(log);
+  };
+
+  evtSource.onerror = function() {
+    document.getElementById('connectionStatus').innerText = 'SSE TELEMETRY: RECONNECTING...';
+    document.getElementById('connectionStatus').className =
+      'px-4 py-1 rounded-full text-xs font-mono font-semibold bg-rose-950 text-rose-300 border border-rose-800';
+  };
+
+  // ─── SIMULATION BUTTONS ─────────────────────────────────
+  function sendBurst(count, isPro) {
+    for (let i = 0; i < count; i++) {
+      fetch('/api/resource', {
+        headers: isPro ? { 'X-API-KEY': 'pro_team_demo_key' } : {}
+      });
+    }
+  }
+</script>
+</body>
+</html>

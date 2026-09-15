@@ -1,0 +1,7 @@
+target/
+*.class
+.vscode/
+.idea/
+*.log
+k6.exe
+k6.zip
